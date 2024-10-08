@@ -1,0 +1,59 @@
+# Makefile for Pub/Sub operations
+
+# Set the Pub/Sub emulator host
+export PUBSUB_EMULATOR_HOST=localhost:9200
+
+# Default project ID (change this or override with make PROJECT_ID=your-project-id)
+PROJECT_ID ?= local-project
+
+# Ensure required commands are available
+REQUIRED_CMDS := curl jq
+$(foreach cmd,$(REQUIRED_CMDS),\
+    $(if $(shell command -v $(cmd) 2> /dev/null),,$(error Please install `$(cmd)`)))
+
+.PHONY: help create-topic publish-message read-messages
+
+help:
+	@echo "Available targets:"
+	@echo "  create-topic TOPIC_NAME=<topic-name>"
+	@echo "  publish-message TOPIC_NAME=<topic-name> MESSAGE=<message>"
+	@echo "  read-messages TOPIC_NAME=<topic-name>"
+
+create-topic:
+	@if [ -z "$(TOPIC_NAME)" ]; then echo "TOPIC_NAME is required"; exit 1; fi
+	@echo "Creating topic: $(TOPIC_NAME)"
+	@curl -X PUT "http://${PUBSUB_EMULATOR_HOST}/v1/projects/${PROJECT_ID}/topics/$(TOPIC_NAME)"
+
+publish-message:
+	@if [ -z "$(TOPIC_NAME)" ]; then echo "TOPIC_NAME is required"; exit 1; fi
+	@if [ -z "$(MESSAGE)" ]; then echo "MESSAGE is required"; exit 1; fi
+	@echo "Publishing message to topic: $(TOPIC_NAME)"
+	@curl -X POST "http://${PUBSUB_EMULATOR_HOST}/v1/projects/${PROJECT_ID}/topics/$(TOPIC_NAME):publish" \
+		-H "Content-Type: application/json" \
+		-d "{\"messages\": [{\"data\": \"$(shell echo -n '$(MESSAGE)' | base64)\"}]}"
+
+read-messages:
+	@if [ -z "$(TOPIC_NAME)" ]; then echo "TOPIC_NAME is required"; exit 1; fi
+	@echo "Reading messages from topic: $(TOPIC_NAME)"
+	@SUBSCRIPTION_NAME="$(TOPIC_NAME)-sub-$$(date +%s)"; \
+	echo "Creating temporary subscription: $$SUBSCRIPTION_NAME"; \
+	curl -X PUT "http://${PUBSUB_EMULATOR_HOST}/v1/projects/${PROJECT_ID}/subscriptions/$$SUBSCRIPTION_NAME" \
+		-H "Content-Type: application/json" \
+		-d "{\"topic\": \"projects/${PROJECT_ID}/topics/$(TOPIC_NAME)\"}"; \
+	while true; do \
+		RESPONSE=$$(curl -s -X POST "http://${PUBSUB_EMULATOR_HOST}/v1/projects/${PROJECT_ID}/subscriptions/$$SUBSCRIPTION_NAME:pull" \
+			-H "Content-Type: application/json" \
+			-d '{"maxMessages": 10}'); \
+		if echo "$$RESPONSE" | jq -e '.receivedMessages | length == 0' > /dev/null; then \
+			echo "No more messages."; \
+			break; \
+		fi; \
+		echo "$$RESPONSE" | jq -r '.receivedMessages[] | "Message: \(.message.data | @base64d)\nPublish Time: \(.message.publishTime)"'; \
+		ACK_IDS=$$(echo "$$RESPONSE" | jq -r '[.receivedMessages[].ackId]'); \
+		curl -s -X POST "http://${PUBSUB_EMULATOR_HOST}/v1/projects/${PROJECT_ID}/subscriptions/$$SUBSCRIPTION_NAME:acknowledge" \
+			-H "Content-Type: application/json" \
+			-d "{\"ackIds\": $$ACK_IDS}" > /dev/null; \
+	done; \
+	echo "Deleting temporary subscription: $$SUBSCRIPTION_NAME"; \
+	curl -X DELETE "http://${PUBSUB_EMULATOR_HOST}/v1/projects/${PROJECT_ID}/subscriptions/$$SUBSCRIPTION_NAME"
+
